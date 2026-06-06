@@ -17,6 +17,9 @@ import numpy as np
 import keyboard
 from PIL import ImageGrab
 import random
+import win32api
+import win32con
+import win32gui
 
 class ShopItem:
     def __init__(self, path='', image=None, price=0, count=0):
@@ -181,15 +184,6 @@ class SecretShopRefresh:
             return
         
         try:
-            #replace with window activate in python
-            # window.minimize()
-            # window.maximize()
-            # window.restore()
-            try:
-                self.window.activate()
-            except Exception as e:
-                print(e)
-            
             self.rs_instance.updateTime()
             self.clickShop()
             time.sleep(1)
@@ -351,25 +345,15 @@ class SecretShopRefresh:
     def addShopItem(self, path: str, name='', price=0, count=0):
         self.rs_instance.addShopItem(path, name, price, count)
 
-    #take screenshot of entire window
+    #take screenshot of window region (no focus/activation needed, window must be visible)
     def takeScreenshot(self):
         try:
-            #replace with window activate in python
-            # window.minimize()
-            # window.maximize()
-            # window.restore()
-            try:
-                self.window.activate()
-            except Exception as e:
-                print(e)
-
-            #fix pyautogui's multiscreen bug
-            #screenshot = pyautogui.screenshot(region=(self.window.left, self.window.top, self.window.width, self.window.height))
-            region=[self.window.left, self.window.top, self.window.width, self.window.height]
-            screenshot = ImageGrab.grab(bbox=(region[0], region[1], region[2] + region[0], region[3] + region[1]), all_screens=True)
-            screenshot = np.array(screenshot)
-            return screenshot
-        
+            region = [self.window.left, self.window.top, self.window.width, self.window.height]
+            screenshot = ImageGrab.grab(
+                bbox=(region[0], region[1], region[0] + region[2], region[1] + region[3]),
+                all_screens=True
+            )
+            return np.array(screenshot)
         except Exception as e:
             print(e)
             return None
@@ -393,6 +377,50 @@ class SecretShopRefresh:
                 return process_screenshot, True
 
         return None, False
+
+    # --- Background click helpers: PostMessage, no physical cursor movement ---
+
+    def _get_hwnd(self):
+        return self.window._hWnd
+
+    def _make_lparam(self, cx, cy):
+        return ((cy & 0xFFFF) << 16) | (cx & 0xFFFF)
+
+    def _to_client(self, screen_x, screen_y):
+        return win32gui.ScreenToClient(self.window._hWnd, (int(screen_x), int(screen_y)))
+
+    def _post_click(self, screen_x, screen_y, clicks=1, interval=0.05):
+        hwnd = self.window._hWnd
+        cx, cy = self._to_client(screen_x, screen_y)
+        lp = self._make_lparam(cx, cy)
+        # WM_MOUSEMOVE first so GPGPC registers cursor position before the click
+        win32api.PostMessage(hwnd, win32con.WM_MOUSEMOVE, 0, lp)
+        time.sleep(0.02)
+        for i in range(clicks):
+            win32api.PostMessage(hwnd, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, lp)
+            time.sleep(0.05)
+            win32api.PostMessage(hwnd, win32con.WM_LBUTTONUP, 0, lp)
+            if i < clicks - 1:
+                time.sleep(interval)
+
+    def _post_drag(self, screen_x1, screen_y1, screen_x2, screen_y2, steps=15, step_delay=0.02):
+        hwnd = self.window._hWnd
+        cx1, cy1 = self._to_client(screen_x1, screen_y1)
+        cx2, cy2 = self._to_client(screen_x2, screen_y2)
+        win32api.PostMessage(hwnd, win32con.WM_MOUSEMOVE, 0, self._make_lparam(cx1, cy1))
+        time.sleep(0.02)
+        win32api.PostMessage(hwnd, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, self._make_lparam(cx1, cy1))
+        time.sleep(0.05)
+        for i in range(1, steps + 1):
+            t = i / steps
+            x = int(cx1 + (cx2 - cx1) * t)
+            y = int(cy1 + (cy2 - cy1) * t)
+            win32api.PostMessage(hwnd, win32con.WM_MOUSEMOVE, win32con.MK_LBUTTON, self._make_lparam(x, y))
+            time.sleep(step_delay)
+        win32api.PostMessage(hwnd, win32con.WM_LBUTTONUP, 0, self._make_lparam(cx2, cy2))
+        time.sleep(0.05)
+
+    # --- End background click helpers ---
 
     #return item position
     def findItemPosition(self, process_screenshot, process_item):
@@ -441,8 +469,7 @@ class SecretShopRefresh:
         if pos is None:
             return False
         x, y = pos
-        pyautogui.moveTo(x, y)
-        pyautogui.click(clicks=2, interval=self.mouse_sleep)
+        self._post_click(x, y, clicks=2, interval=self.mouse_sleep)
         time.sleep(self.mouse_sleep)
         self.clickConfirmBuy()
         return True
@@ -450,30 +477,22 @@ class SecretShopRefresh:
     def clickConfirmBuy(self):
         x = self.window.left + self.window.width * 0.55
         y = self.window.top + self.window.height * 0.70
-        pyautogui.moveTo(x, y)
-        pyautogui.click(clicks=2, interval=self.mouse_sleep)
+        self._post_click(x, y, clicks=2, interval=self.mouse_sleep)
         time.sleep(self.mouse_sleep)
         time.sleep(self.screenshot_sleep)   #Account for Loading
-
-        # #checks if loading screen is blocking
-        # screenshot = self.takeScreenshot()
-        # process_screenshot = cv2.cvtColor(screenshot, cv2.COLOR_BGR2GRAY)
-        # self.checkLoading(process_screenshot)
 
     #REFRESH MACRO
     def clickRefresh(self):
         x = self.window.left + self.window.width * 0.20
         y = self.window.top + self.window.height * 0.90
-        pyautogui.moveTo(x, y)
-        pyautogui.click(clicks=2, interval=self.mouse_sleep)
+        self._post_click(x, y, clicks=2, interval=self.mouse_sleep)
         time.sleep(self.mouse_sleep)
         self.clickConfirmRefresh()
 
     def clickConfirmRefresh(self):
         x = self.window.left + self.window.width * 0.58
         y = self.window.top + self.window.height * 0.65
-        pyautogui.moveTo(x, y)
-        pyautogui.click(clicks=2, interval=self.mouse_sleep)
+        self._post_click(x, y, clicks=2, interval=self.mouse_sleep)
         time.sleep(self.screenshot_sleep)   #Account for Loading
 
     #SHOP MACRO
@@ -481,46 +500,31 @@ class SecretShopRefresh:
         #wake window
         x = self.window.left + self.window.width * 0.05
         y = self.window.top + self.window.height * 0.41
-        pyautogui.moveTo(x, y)
-        pyautogui.click()
-
+        self._post_click(x, y)
         time.sleep(self.mouse_sleep)
 
         #old lobby
         x = self.window.left + self.window.width * 0.44
         y = self.window.top + self.window.height * 0.26
-        pyautogui.moveTo(x, y)
-        pyautogui.click()
-
+        self._post_click(x, y)
         time.sleep(self.mouse_sleep)
 
         #new lobby
         x = self.window.left + self.window.width * 0.05
         y = self.window.top + self.window.height * 0.41
-        pyautogui.moveTo(x, y)
-        pyautogui.click()
+        self._post_click(x, y)
 
     def scrollShop(self):
         x = self.window.left + self.window.width * 0.58
-        y = self.window.top + self.window.height * 0.65
-        pyautogui.moveTo(x, y)
-        time.sleep(0.05)
-        pyautogui.mouseDown(button='left')
-        time.sleep(0.05)
-        pyautogui.moveTo(x, y-self.window.height*0.277)
-        time.sleep(0.05)
-        pyautogui.mouseUp(button='left')
-        time.sleep(0.05)
-    
+        y1 = self.window.top + self.window.height * 0.65
+        y2 = y1 - self.window.height * 0.277
+        self._post_drag(x, y1, x, y2)
+
     def scrollUp(self):
         x = self.window.left + self.window.width * 0.58
-        y = self.window.top + self.window.height * 0.65
-        pyautogui.moveTo(x, y-self.window.height*0.277)
-        time.sleep(0.1)
-        pyautogui.mouseDown(button='left')
-        time.sleep(0.1)
-        pyautogui.moveTo(x, y)
-        pyautogui.mouseUp(button='left')
+        y1 = self.window.top + self.window.height * (0.65 - 0.277)
+        y2 = self.window.top + self.window.height * 0.65
+        self._post_drag(x, y1, x, y2)
 
 class AppConfig():
     def __init__(self):
