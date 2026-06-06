@@ -333,34 +333,31 @@ class SecretShopRefresh:
         self.loop_finish = True
         self.callback()
 
-    #show mini display
+    #show live purchase counters inline on the main window (instead of a separate popup)
     def showMiniDisplays(self, mini_images):
         bg_color = '#171717'
         fg_color = '#dddddd'
 
         if self.tk_instance is None:
             return None, None
-        #Display exit key
-        hint = tk.Toplevel(self.tk_instance)
-        hint.geometry(r'200x200+%d+%d' % (self._win_left, self._win_top + self._win_h))
-        hint.title('Hint')
-        hint.iconbitmap(os.path.join('assets','icon.ico'))
-        tk.Label(master=hint, text='Press ESC to stop refreshing!', bg=bg_color, fg=fg_color).pack()
-        hint.config(bg=bg_color)
+        #inline panel packed at the bottom of the main window; destroyed when refresh ends
+        hint = tk.Frame(self.tk_instance, bg=bg_color)
+        tk.Label(master=hint, text='Press ESC to stop refreshing!', bg=bg_color, fg=fg_color).pack(pady=(8, 4))
 
-        #Display stat
+        #Display stat - item icon + count, laid out in a row to keep it compact
         mini_stats = tk.Frame(master=hint, bg=bg_color)
         mini_labels = []
-        
+
         #packing mini image
         for img in mini_images:
             frame = tk.Frame(mini_stats, bg=bg_color)
             tk.Label(master=frame, image=img, bg=bg_color).pack(side=tk.LEFT)
-            count = tk.Label(master=frame, text='0', bg=bg_color, fg='#FFBF00')
-            count.pack(side=tk.RIGHT)
+            count = tk.Label(master=frame, text='0', bg=bg_color, fg='#FFBF00', font=('Helvetica', 14))
+            count.pack(side=tk.RIGHT, padx=(4, 0))
             mini_labels.append(count)
-            frame.pack()
-        mini_stats.pack()
+            frame.pack(side=tk.LEFT, padx=8)
+        mini_stats.pack(pady=(0, 8))
+        hint.pack()
         return hint, mini_labels
 
     #add item to list
@@ -853,8 +850,10 @@ class AutoRefreshGUI:
         self.root.title('SHOP AUTO REFRESH')
         self.start_button.config(state=tk.NORMAL)
         self.lock_start_button = False
+        #shrink back now that the inline counters are gone
+        self.root.geometry('420x785')
 
-    #start refresh loop    
+    #start refresh loop
     def startShopRefresh(self):
         self.root.title('Press ESC to stop!')
         self.lock_start_button = True
@@ -863,6 +862,8 @@ class AutoRefreshGUI:
 
         if self.hint_cbv.get():
             self.ssr.tk_instance = self.root
+            #make room for the inline purchase counters at the bottom of the window
+            self.root.geometry('420x880')
 
         if not self.move_zerozero_cbv.get():
             self.ssr.allow_move = True
