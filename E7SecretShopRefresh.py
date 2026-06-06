@@ -15,11 +15,12 @@ import pygetwindow as gw
 import cv2
 import numpy as np
 import keyboard
-from PIL import ImageGrab
 import random
 import win32api
 import win32con
 import win32gui
+import win32ui
+from ctypes import windll
 
 class ShopItem:
     def __init__(self, path='', image=None, price=0, count=0):
@@ -105,6 +106,15 @@ class SecretShopRefresh:
         self.allow_move = allow_move
         self.join_thread = join_thread
 
+        #cached window geometry, captured once while the window is restored so the
+        #macro keeps working after the window is minimized (positions go invalid then)
+        self._win_left = 0
+        self._win_top = 0
+        self._win_w = 906
+        self._win_h = 539
+        self._client_off_x = 0
+        self._client_off_y = 0
+
         self.loading_asset = cv2.imread(os.path.join('assets', 'loading.jpg'))
         self.loading_asset= cv2.cvtColor(self.loading_asset, cv2.COLOR_BGR2GRAY)
 
@@ -150,6 +160,10 @@ class SecretShopRefresh:
                 self.window.restore()
             if not self.allow_move: self.window.moveTo(0, 0)
             self.window.resizeTo(906, 539)
+            time.sleep(0.2)
+            #snapshot geometry while the window is on-screen; PrintWindow capture and
+            #all clicks use these cached values, so they survive the window being minimized
+            self._captureGeometry()
         except Exception as e:
             print(e)
             self.loop_active = False
@@ -191,11 +205,9 @@ class SecretShopRefresh:
             #item sliding const
             sliding_time = max(0.7+self.screenshot_sleep, 1)
 
-            #Loop through shop 
+            #Loop through shop
             while self.loop_active:
-                
-                self.window.resizeTo(906, 539)
-                
+
                 # screenshot = self.takeScreenshot()
                 # ss = cv2.cvtColor(screenshot, cv2.COLOR_BGR2RGB)
                 # cv2.imwrite('screenshot.png',ss)
@@ -320,7 +332,7 @@ class SecretShopRefresh:
             return None, None
         #Display exit key
         hint = tk.Toplevel(self.tk_instance)
-        hint.geometry(r'200x200+%d+%d' % (self.window.left, self.window.top+self.window.height))
+        hint.geometry(r'200x200+%d+%d' % (self._win_left, self._win_top + self._win_h))
         hint.title('Hint')
         hint.iconbitmap(os.path.join('assets','icon.ico'))
         tk.Label(master=hint, text='Press ESC to stop refreshing!', bg=bg_color, fg=fg_color).pack()
@@ -345,18 +357,55 @@ class SecretShopRefresh:
     def addShopItem(self, path: str, name='', price=0, count=0):
         self.rs_instance.addShopItem(path, name, price, count)
 
-    #take screenshot of window region (no focus/activation needed, window must be visible)
+    #cache window geometry while it is restored/on-screen. PrintWindow capture and all
+    #clicks rely on these instead of live window.left/top so they keep working when minimized
+    def _captureGeometry(self):
+        hwnd = self.window._hWnd
+        l, t, r, b = win32gui.GetWindowRect(hwnd)
+        self._win_left, self._win_top = l, t
+        self._win_w, self._win_h = r - l, b - t
+        #offset of the client area origin relative to the window origin (left border, title bar)
+        csx, csy = win32gui.ClientToScreen(hwnd, (0, 0))
+        self._client_off_x, self._client_off_y = csx - l, csy - t
+
+    #grab the window's own pixels via PrintWindow (works while minimized/occluded, no focus).
+    #returns an RGB array matching the full window rect, same layout as the old ImageGrab path
     def takeScreenshot(self):
+        hwnd = self.window._hWnd
+        w, h = self._win_w, self._win_h
+        window_dc = mfc_dc = save_dc = save_bitmap = None
         try:
-            region = [self.window.left, self.window.top, self.window.width, self.window.height]
-            screenshot = ImageGrab.grab(
-                bbox=(region[0], region[1], region[0] + region[2], region[1] + region[3]),
-                all_screens=True
-            )
-            return np.array(screenshot)
+            window_dc = win32gui.GetWindowDC(hwnd)
+            mfc_dc = win32ui.CreateDCFromHandle(window_dc)
+            save_dc = mfc_dc.CreateCompatibleDC()
+            save_bitmap = win32ui.CreateBitmap()
+            save_bitmap.CreateCompatibleBitmap(mfc_dc, w, h)
+            save_dc.SelectObject(save_bitmap)
+
+            #PW_RENDERFULLCONTENT = 2, asks DWM-composited apps to render their full content
+            result = windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), 2)
+            if result != 1:
+                print('PrintWindow failed (returned %s) - window may be using hardware rendering' % result)
+
+            bmp_info = save_bitmap.GetInfo()
+            bmp_str = save_bitmap.GetBitmapBits(True)
+            #32-bit DIB is laid out as B,G,R,X
+            img = np.frombuffer(bmp_str, dtype=np.uint8).reshape(
+                (bmp_info['bmHeight'], bmp_info['bmWidth'], 4))
+            img = cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2RGB)
+            return img
         except Exception as e:
             print(e)
             return None
+        finally:
+            if save_bitmap is not None:
+                win32gui.DeleteObject(save_bitmap.GetHandle())
+            if save_dc is not None:
+                save_dc.DeleteDC()
+            if mfc_dc is not None:
+                mfc_dc.DeleteDC()
+            if window_dc is not None:
+                win32gui.ReleaseDC(hwnd, window_dc)
         
     def checkLoading(self, process_screenshot):
         result = cv2.matchTemplate(process_screenshot, self.loading_asset, cv2.TM_CCOEFF_NORMED)
@@ -386,12 +435,14 @@ class SecretShopRefresh:
     def _make_lparam(self, cx, cy):
         return ((cy & 0xFFFF) << 16) | (cx & 0xFFFF)
 
-    def _to_client(self, screen_x, screen_y):
-        return win32gui.ScreenToClient(self.window._hWnd, (int(screen_x), int(screen_y)))
+    #convert a point expressed relative to the window's top-left corner (the same space as
+    #the captured bitmap) into client coordinates for the click messages
+    def _to_client(self, win_x, win_y):
+        return (int(win_x - self._client_off_x), int(win_y - self._client_off_y))
 
-    def _post_click(self, screen_x, screen_y, clicks=1, interval=0.05):
+    def _post_click(self, win_x, win_y, clicks=1, interval=0.05):
         hwnd = self.window._hWnd
-        cx, cy = self._to_client(screen_x, screen_y)
+        cx, cy = self._to_client(win_x, win_y)
         lp = self._make_lparam(cx, cy)
         # WM_MOUSEMOVE first so GPGPC registers cursor position before the click
         win32api.PostMessage(hwnd, win32con.WM_MOUSEMOVE, 0, lp)
@@ -403,10 +454,10 @@ class SecretShopRefresh:
             if i < clicks - 1:
                 time.sleep(interval)
 
-    def _post_drag(self, screen_x1, screen_y1, screen_x2, screen_y2, steps=15, step_delay=0.02):
+    def _post_drag(self, win_x1, win_y1, win_x2, win_y2, steps=15, step_delay=0.02):
         hwnd = self.window._hWnd
-        cx1, cy1 = self._to_client(screen_x1, screen_y1)
-        cx2, cy2 = self._to_client(screen_x2, screen_y2)
+        cx1, cy1 = self._to_client(win_x1, win_y1)
+        cx2, cy2 = self._to_client(win_x2, win_y2)
         win32api.PostMessage(hwnd, win32con.WM_MOUSEMOVE, 0, self._make_lparam(cx1, cy1))
         time.sleep(0.02)
         win32api.PostMessage(hwnd, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, self._make_lparam(cx1, cy1))
@@ -458,8 +509,8 @@ class SecretShopRefresh:
             time.sleep(1)
         
         if loc[0].size > 0:
-            x = self.window.left + self.window.width*0.90
-            y = self.window.top + loc[0][0] + self.window.height*0.085
+            x = self._win_w * 0.90
+            y = loc[0][0] + self._win_h * 0.085
             pos = (x, y)
             return pos
         return None
@@ -475,55 +526,55 @@ class SecretShopRefresh:
         return True
 
     def clickConfirmBuy(self):
-        x = self.window.left + self.window.width * 0.55
-        y = self.window.top + self.window.height * 0.70
+        x = self._win_w * 0.55
+        y = self._win_h * 0.70
         self._post_click(x, y, clicks=2, interval=self.mouse_sleep)
         time.sleep(self.mouse_sleep)
         time.sleep(self.screenshot_sleep)   #Account for Loading
 
     #REFRESH MACRO
     def clickRefresh(self):
-        x = self.window.left + self.window.width * 0.20
-        y = self.window.top + self.window.height * 0.90
+        x = self._win_w * 0.20
+        y = self._win_h * 0.90
         self._post_click(x, y, clicks=2, interval=self.mouse_sleep)
         time.sleep(self.mouse_sleep)
         self.clickConfirmRefresh()
 
     def clickConfirmRefresh(self):
-        x = self.window.left + self.window.width * 0.58
-        y = self.window.top + self.window.height * 0.65
+        x = self._win_w * 0.58
+        y = self._win_h * 0.65
         self._post_click(x, y, clicks=2, interval=self.mouse_sleep)
         time.sleep(self.screenshot_sleep)   #Account for Loading
 
     #SHOP MACRO
     def clickShop(self):
         #wake window
-        x = self.window.left + self.window.width * 0.05
-        y = self.window.top + self.window.height * 0.41
+        x = self._win_w * 0.05
+        y = self._win_h * 0.41
         self._post_click(x, y)
         time.sleep(self.mouse_sleep)
 
         #old lobby
-        x = self.window.left + self.window.width * 0.44
-        y = self.window.top + self.window.height * 0.26
+        x = self._win_w * 0.44
+        y = self._win_h * 0.26
         self._post_click(x, y)
         time.sleep(self.mouse_sleep)
 
         #new lobby
-        x = self.window.left + self.window.width * 0.05
-        y = self.window.top + self.window.height * 0.41
+        x = self._win_w * 0.05
+        y = self._win_h * 0.41
         self._post_click(x, y)
 
     def scrollShop(self):
-        x = self.window.left + self.window.width * 0.58
-        y1 = self.window.top + self.window.height * 0.65
-        y2 = y1 - self.window.height * 0.277
+        x = self._win_w * 0.58
+        y1 = self._win_h * 0.65
+        y2 = y1 - self._win_h * 0.277
         self._post_drag(x, y1, x, y2)
 
     def scrollUp(self):
-        x = self.window.left + self.window.width * 0.58
-        y1 = self.window.top + self.window.height * (0.65 - 0.277)
-        y2 = self.window.top + self.window.height * 0.65
+        x = self._win_w * 0.58
+        y1 = self._win_h * (0.65 - 0.277)
+        y2 = self._win_h * 0.65
         self._post_drag(x, y1, x, y2)
 
 class AppConfig():
