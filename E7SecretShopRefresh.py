@@ -94,7 +94,7 @@ class RefreshStatistic:
             writer.writerow(data)
 
 class SecretShopRefresh:
-    def __init__(self, title_name: str, callback = None, tk_instance: tk = None, budget: int = None, allow_move: bool = False, debug: bool = False, join_thread: bool = False):
+    def __init__(self, title_name: str, callback = None, tk_instance: tk = None, budget: int = None, allow_move: bool = False, debug: bool = False, join_thread: bool = False, hide_offscreen: bool = False):
         #init state
         self.debug = debug
         self.loop_active = False
@@ -105,6 +105,10 @@ class SecretShopRefresh:
         self.budget = budget
         self.allow_move = allow_move
         self.join_thread = join_thread
+        #move the emulator off-screen (still rendered) instead of minimizing it.
+        #minimized D3D/OpenGL emulators stop rendering, so PrintWindow returns a black
+        #frame and nothing is detected; off-screen windows are still composited by DWM
+        self.hide_offscreen = hide_offscreen
 
         #cached window geometry, captured once while the window is restored so the
         #macro keeps working after the window is minimized (positions go invalid then)
@@ -162,8 +166,11 @@ class SecretShopRefresh:
             self.window.resizeTo(906, 539)
             time.sleep(0.2)
             #snapshot geometry while the window is on-screen; PrintWindow capture and
-            #all clicks use these cached values, so they survive the window being minimized
+            #all clicks use these cached values, so they survive the window being moved
             self._captureGeometry()
+            #optionally tuck the window off-screen instead of relying on minimize
+            if self.hide_offscreen:
+                self._moveOffScreen()
         except Exception as e:
             print(e)
             self.loop_active = False
@@ -193,6 +200,7 @@ class SecretShopRefresh:
         
         if not self.loop_active:
             if hint: hint.destroy()
+            if self.hide_offscreen: self._restorePosition()
             self.loop_finish = True
             self.callback()
             return
@@ -311,13 +319,15 @@ class SecretShopRefresh:
         except Exception as e:
             print(e)
             if hint: hint.destroy()
+            if self.hide_offscreen: self._restorePosition()
             self.rs_instance.writeToCSV()
             self.loop_active = False
             self.loop_finish = True
             self.callback()
             return
-            
+
         if hint: hint.destroy()
+        if self.hide_offscreen: self._restorePosition()
         self.rs_instance.writeToCSV()
         self.loop_active = False
         self.loop_finish = True
@@ -367,6 +377,25 @@ class SecretShopRefresh:
         #offset of the client area origin relative to the window origin (left border, title bar)
         csx, csy = win32gui.ClientToScreen(hwnd, (0, 0))
         self._client_off_x, self._client_off_y = csx - l, csy - t
+
+    #park the window just past the right edge of the whole virtual desktop. It stays
+    #restored (so DWM keeps rendering it and PrintWindow keeps returning real pixels),
+    #but it is no longer visible and the mouse is free
+    def _moveOffScreen(self):
+        v_left = win32api.GetSystemMetrics(win32con.SM_XVIRTUALSCREEN)
+        v_top = win32api.GetSystemMetrics(win32con.SM_YVIRTUALSCREEN)
+        v_width = win32api.GetSystemMetrics(win32con.SM_CXVIRTUALSCREEN)
+        off_x = v_left + v_width + 50
+        win32gui.SetWindowPos(self.window._hWnd, 0, off_x, v_top, 0, 0,
+                              win32con.SWP_NOSIZE | win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
+
+    #put the window back where it was captured so the user gets it on-screen again
+    def _restorePosition(self):
+        try:
+            win32gui.SetWindowPos(self.window._hWnd, 0, self._win_left, self._win_top, 0, 0,
+                                  win32con.SWP_NOSIZE | win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
+        except Exception as e:
+            print(e)
 
     #grab the window's own pixels via PrintWindow (works while minimized/occluded, no focus).
     #returns an RGB array matching the full window rect, same layout as the old ImageGrab path
@@ -609,8 +638,8 @@ class AutoRefreshGUI:
         #self.root.attributes("-alpha", 0.95)
 
         self.root.title('SHOP AUTO REFRESH')
-        self.root.geometry('420x745')
-        self.root.minsize(420, 745)
+        self.root.geometry('420x785')
+        self.root.minsize(420, 785)
         icon_path = os.path.join('assets', 'gui_icon.ico')
         self.root.iconbitmap(icon_path)
         self.title_name = ''
@@ -661,9 +690,10 @@ class AutoRefreshGUI:
         special_frame = tk.Frame(self.root, bg=self.unite_bg_color)
         self.hint_cbv = tk.BooleanVar(value=True)
         self.move_zerozero_cbv = tk.BooleanVar(value=True)
+        self.hide_offscreen_cbv = tk.BooleanVar(value=False)
         # self.random_click_cbv = tk.BooleanVar(value=False)
         # self.debug_cbv = tk.BooleanVar(value=False)
-        
+
         def setupSpecialSetting(label, value):
             frame = tk.Frame(special_frame, bg=self.unite_bg_color)
             special_label = tk.Label(master=frame,
@@ -675,13 +705,15 @@ class AutoRefreshGUI:
                                 font=('Helvetica',14),
                                 variable=value,
                                 bg=self.unite_bg_color)
-            special_cb.select()
+            if value.get():
+                special_cb.select()
             special_label.pack(side=tk.LEFT)
             special_cb.pack(side=tk.RIGHT)
             frame.pack()
 
         setupSpecialSetting('Hint:', self.hint_cbv)
         setupSpecialSetting('Auto move emulator window to top left:', self.move_zerozero_cbv)
+        setupSpecialSetting('Hide emulator off-screen (use instead of minimize):', self.hide_offscreen_cbv)
         
         # setupSpecialSetting('Random click offset:', self.random_click_cbv)
         # setupSpecialSetting('Check random click offset:', self.debug_cbv)
@@ -834,6 +866,9 @@ class AutoRefreshGUI:
 
         if not self.move_zerozero_cbv.get():
             self.ssr.allow_move = True
+
+        if self.hide_offscreen_cbv.get():
+            self.ssr.hide_offscreen = True
 
         #setting item to refresh for
         for item in self.app_config.ALL_ITEMS:
